@@ -15,5 +15,3 @@ myshell> pwd
 myshell> ls
 src include README.md
 
-myshell> date
-Fri May 29 ...
