@@ -1,0 +1,10 @@
+a.txt
+include
+input.txt
+Makefile
+output.txt
+out.txt
+README.md
+shell
+src
+test.txt
