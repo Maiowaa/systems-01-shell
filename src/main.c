@@ -6,17 +6,24 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #define MAX_ARGS 64
+#define MAX_CMDS 16
 
 int parse_input(char *input, char *argv[]);
 int execute_builtin(char *argv[], int argc);
 void execute_external(char *argv[], int argc);
+int split_pipeline(char *input, char *cmds[]);
+void execute_pipeline(char *cmds[], int ncmds);
+void exec_command(char *argv[]);
+char *trim_whitespace(char *str);
 
 
 int main()
 {
     char input[1024];
     char *argv[64];
+    char *cmds[MAX_CMDS];
     int argc;
+    int ncmds;
     
     while (1)
     {
@@ -27,6 +34,15 @@ int main()
             break;
         
         input[strcspn(input, "\n")] = '\0';
+        
+        ncmds = split_pipeline(input, cmds);
+        if (ncmds == 0)
+            continue;
+        if (ncmds > 1)
+        {
+            execute_pipeline(cmds, ncmds);
+            continue;
+        }
         
         argc = parse_input(input, argv);
         if (argc == 0)
@@ -55,6 +71,209 @@ int parse_input(char *input, char *argv[])
     }
     argv[argc] = NULL;
     return argc;  // return argc so caller knows how many args
+}
+
+char *trim_whitespace(char *str)
+{
+    char *end;
+    while (*str == ' ' || *str == '\t')
+        str++;
+    if (*str == '\0')
+        return str;
+    end = str + strlen(str) - 1;
+    while (end > str && (*end == ' ' || *end == '\t'))
+        end--;
+    end[1] = '\0';
+    return str;
+}
+
+int split_pipeline(char *input, char *cmds[])
+{
+    int count = 0;
+    char *token = strtok(input, "|");
+
+    while (token != NULL && count < MAX_CMDS)
+    {
+        cmds[count++] = trim_whitespace(token);
+        token = strtok(NULL, "|");
+    }
+    return count;
+}
+
+void exec_command(char *argv[])
+{
+    char *input_file = NULL;
+    char *output_file = NULL;
+    int new_argc = 0;
+
+    while (argv[new_argc] != NULL)
+        new_argc++;
+
+    for (int i = 0; i < new_argc; i++)
+    {
+        if (strcmp(argv[i], ">") == 0)
+        {
+            if (output_file != NULL)
+            {
+                fprintf(stderr, "Multiple output redirections not supported\n");
+                exit(1);
+            }
+            if (i + 1 >= new_argc)
+            {
+                fprintf(stderr, "Missing output file\n");
+                exit(1);
+            }
+            output_file = argv[i + 1];
+            for (int j = i; j + 2 < new_argc; j++)
+                argv[j] = argv[j + 2];
+            new_argc -= 2;
+            argv[new_argc] = NULL;
+            i--;
+            continue;
+        }
+
+        if (strcmp(argv[i], "<") == 0)
+        {
+            if (input_file != NULL)
+            {
+                fprintf(stderr, "Multiple input redirections not supported\n");
+                exit(1);
+            }
+            if (i + 1 >= new_argc)
+            {
+                fprintf(stderr, "Missing input file\n");
+                exit(1);
+            }
+            input_file = argv[i + 1];
+            for (int j = i; j + 2 < new_argc; j++)
+                argv[j] = argv[j + 2];
+            new_argc -= 2;
+            argv[new_argc] = NULL;
+            i--;
+            continue;
+        }
+    }
+
+    if (input_file != NULL)
+    {
+        int fd = open(input_file, O_RDONLY);
+        if (fd < 0)
+        {
+            perror("open");
+            exit(1);
+        }
+        if (dup2(fd, STDIN_FILENO) < 0)
+        {
+            perror("dup2");
+            close(fd);
+            exit(1);
+        }
+        close(fd);
+    }
+
+    if (output_file != NULL)
+    {
+        int fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0)
+        {
+            perror("open");
+            exit(1);
+        }
+        if (dup2(fd, STDOUT_FILENO) < 0)
+        {
+            perror("dup2");
+            close(fd);
+            exit(1);
+        }
+        close(fd);
+    }
+
+    execvp(argv[0], argv);
+    perror("execvp");
+    exit(1);
+}
+
+void execute_pipeline(char *cmds[], int ncmds)
+{
+    int pipefd[MAX_CMDS - 1][2];
+    pid_t pids[MAX_CMDS];
+    int prev_fd = -1;
+
+    for (int i = 0; i < ncmds; i++)
+    {
+        char *argv[MAX_ARGS];
+        int argc = parse_input(cmds[i], argv);
+        if (argc == 0)
+        {
+            fprintf(stderr, "Invalid null command in pipeline\n");
+            return;
+        }
+        if (strcmp(argv[0], "cd") == 0 || strcmp(argv[0], "exit") == 0)
+        {
+            fprintf(stderr, "Built-in commands are not supported in pipelines\n");
+            return;
+        }
+
+        if (i < ncmds - 1)
+        {
+            if (pipe(pipefd[i]) < 0)
+            {
+                perror("pipe");
+                return;
+            }
+        }
+
+        pid_t pid = fork();
+        if (pid < 0)
+        {
+            perror("fork");
+            return;
+        }
+
+        if (pid == 0)
+        {
+            if (prev_fd != -1)
+            {
+                if (dup2(prev_fd, STDIN_FILENO) < 0)
+                {
+                    perror("dup2");
+                    exit(1);
+                }
+            }
+            if (i < ncmds - 1)
+            {
+                if (dup2(pipefd[i][1], STDOUT_FILENO) < 0)
+                {
+                    perror("dup2");
+                    exit(1);
+                }
+            }
+
+            for (int j = 0; j < ncmds - 1; j++)
+            {
+                close(pipefd[j][0]);
+                close(pipefd[j][1]);
+            }
+            if (prev_fd != -1)
+                close(prev_fd);
+
+            exec_command(argv);
+        }
+        else
+        {
+            pids[i] = pid;
+            if (prev_fd != -1)
+                close(prev_fd);
+            if (i < ncmds - 1)
+            {
+                close(pipefd[i][1]);
+                prev_fd = pipefd[i][0];
+            }
+        }
+    }
+
+    for (int i = 0; i < ncmds; i++)
+        waitpid(pids[i], NULL, 0);
 }
 
 // Execute built-in commands; return 1 if executed, 0 if not
